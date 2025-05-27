@@ -6,12 +6,18 @@ from abc import ABC
 
 """
 Author: David Goll
-This module contains the classes and methods used to generate the figures in the paper "Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning: Transient Cooperation, Metastability, and Oscillations" by D. Goll, J. Heitzig, and W. Barfuss, 2024, ArXiv.
-The code is not meant to be used as a library, but rather as a collection of classes and methods that can be used to generate the figures in the paper.
-It originated from the code used in my master thesis, from which not all classes and methods were used in the paper.
 
-For example, originally the Agent class was designed to be used as a parent class for different types of agents (Q-learning, SARSA, ExpectedSARSA, Cross-Learning, etc.) that can play a repeated normal-form game and observe past joint actions.
-Since the paper is only concerned with single-state environments, some methods related to observations of past states are not relevant. These include for example "get_next_state", "translate_key_to_state", "translate_state_to_key", ...
+This module implements a flexible simulation framework for multi-agent reinforcement learning in repeated normal-form games, as used in the paper:
+"Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning: Transient Cooperation, Metastability, and Oscillations" (D. Goll, J. Heitzig, W. Barfuss, 2024, ArXiv).
+
+Key features:
+- Modular agent classes supporting Q-Learning and FrequencyAdjusted Q-learning with extensible design for additional algorithms (SARSA, Expected SARSA, CrossLearning, ...).
+- Abstract Agent base class for repeated games, supporting customizable action spaces, reward functions, and observation histories.
+- Game and Simulation classes to conduct multi-agent interactions.
+- Utilities for analyzing learning dynamics, fixed points, and stability in the context of the Prisoner's Dilemma and similar games.
+
+Note: The code is research-oriented and tailored for generating figures and results in the referenced paper. 
+While not structured as a general-purpose library, it is organized for clarity, extensibility, and reproducibility of the depicted experiments.
 """
 
 ################################### Agent classes ###################################
@@ -416,6 +422,65 @@ class QLearningAgent(Agent):
 
         # update Q-value
         self.q_table[state, action_id] = (1 - self.learning_rate) * self.q_table[state, action_id] + self.learning_rate * ( self.prefactor * reward + self.discount_factor * np.max(self.q_table[next_state, :]) ) 
+        self.q_table_history.append(self.q_table.copy()) 
+
+class FreqAdjustedQLearningAgent(QLearningAgent):
+    def __init__(self, 
+                 player_id,
+                 action_space, 
+                 learning_rate = 0.1, 
+                 discount_factor = 0.9, 
+                 exploration_rate = 0.2,
+                 num_players = None,
+                 observation_length = 0,
+                 temperature = 1,
+                 reward_func = None,
+                 state = None, 
+                 q_table = None,
+                 agent_id = None,
+                 selection_method="epsilon_greedy",
+                 use_prefactor = False,
+                 learning_rate_adjustment = None):
+        super().__init__(player_id,
+                         action_space, 
+                         learning_rate, 
+                         discount_factor, 
+                         exploration_rate,
+                         num_players,
+                         observation_length,
+                         temperature,
+                         reward_func,
+                         state, 
+                         q_table,
+                         agent_id,
+                         selection_method, 
+                         use_prefactor)
+        self.name = "FreqAdjustedQL"
+        if learning_rate_adjustment is None:
+            self.learning_rate_adjustment = learning_rate
+        else:
+            self.learning_rate_adjustment = learning_rate_adjustment 
+
+    def update_policy(self, current_info):
+        """
+        This function updates the Q-table of the QLearningAgent according to the Q-Learning algorithm.
+        The prefactor (1 - self.discount_factor) is missing in the formula in the book (Sutton & Barto, 2018, p. 131. It is taken from 2021 paper by Barfuss:
+        "factor (1 - self.discount_factor) normalizes the state- action values to be on the same numerical scale as the rewards." - Barfuss "Dynamical systems as a level of cognitive analysis of multi-agent learning" 2021, p. 4
+
+        Args:
+            current_info (dict): Dictionary containing the current information which is presented to the agents.
+        """
+        state = current_info['state']
+        action = current_info['action']
+        reward = current_info['reward']
+        next_state = current_info['next_state']
+        action_id = np.where(self.action_space == action)
+
+        # get probability to choose the action
+        action_probability = self.get_action_probabilities(self.q_table)[state][action_id]
+
+        # update Q-value
+        self.q_table[state, action_id] = self.q_table[state, action_id] + min(self.learning_rate_adjustment/action_probability, 1) * self.learning_rate * ( self.prefactor * reward + self.discount_factor * np.max(self.q_table[next_state, :]) - self.q_table[state, action_id]) 
         self.q_table_history.append(self.q_table.copy()) 
 
 ################################### Game class ###################################

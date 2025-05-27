@@ -1,8 +1,6 @@
 import numpy as np
-#import matplotlib.pyplot as plt
 from scipy.optimize import fsolve
 from abc import ABC
-
 
 """
 Author: David Goll
@@ -423,6 +421,99 @@ class QLearningAgent(Agent):
         # update Q-value
         self.q_table[state, action_id] = (1 - self.learning_rate) * self.q_table[state, action_id] + self.learning_rate * ( self.prefactor * reward + self.discount_factor * np.max(self.q_table[next_state, :]) ) 
         self.q_table_history.append(self.q_table.copy()) 
+
+class SarsaAgent(Agent):
+    """
+    This class implements a SARSA agent.
+
+    Args:
+        Agent (_type_): _description_
+    """
+    def __init__(self, 
+                 player_id,
+                 action_space, 
+                 learning_rate = 0.1, 
+                 discount_factor = 0.9, 
+                 exploration_rate = 0.2,
+                 num_players = None,
+                 observation_length = 0,
+                 temperature = 1,
+                 reward_func = None,
+                 state = None, 
+                 q_table = None,
+                 agent_id = None,
+                 selection_method="epsilon_greedy",
+                 use_prefactor = False):
+        super().__init__(player_id,
+                         action_space, 
+                         learning_rate, 
+                         discount_factor, 
+                         exploration_rate,
+                         num_players,
+                         observation_length,
+                         temperature,
+                         reward_func,
+                         state, 
+                         q_table,
+                         agent_id,
+                         selection_method)
+        # Add any Sarsa-specific initialization here
+        self.name = "SARSA"
+        if use_prefactor:
+            self.prefactor = (1 - self.discount_factor)
+        else:
+            self.prefactor = 1
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_reward = None
+    
+    def reset(self):
+        super().reset()
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_reward = None
+
+    def update_policy(self, current_info):
+        """
+        This function updates the Q-table of the SarsaAgent according to the SARSA algorithm.
+
+        Args:
+            current_info (dict): Dictionary containing 'prev_state', 'prev_action', 'prev_reward', 'state', 'action', 'reward' and 'next_state'.
+        """
+        prev_state = current_info['prev_state']
+        prev_action = current_info['prev_action']
+        prev_reward = current_info['prev_reward']
+        state = current_info['state']
+        action = current_info['action']
+        prev_action_id = np.where(self.action_space == prev_action)
+        action_id = np.where(self.action_space == action)
+
+        # don't update policy if prev_state is None or negative
+        if prev_state == None or prev_state < 0:
+            return
+
+        # update Q-value
+        self.q_table[prev_state, prev_action_id] = (1 - self.learning_rate) * self.q_table[prev_state, prev_action_id] + self.learning_rate * ( self.prefactor * prev_reward + self.discount_factor * self.q_table[state, action_id] ) 
+        self.q_table_history.append(self.q_table.copy())   
+        
+    def update_attributes(self, current_info):
+        """
+        This function updates the attributes of the SarsaAgent.
+
+        Args:
+            current_info (dict): Dictionary containing 'state', 'action', 'reward' and 'next_state'.
+        """
+        state = current_info['state']
+        action = current_info['action']
+        reward = current_info['reward']
+        next_state = current_info['next_state']
+
+        self.state_history.append(state) # save state in attribute of agent
+
+        self.prev_state = state
+        self.prev_action = action
+        self.prev_reward = reward
+        self.state = next_state
 
 class FreqAdjustedQLearningAgent(QLearningAgent):
     def __init__(self, 

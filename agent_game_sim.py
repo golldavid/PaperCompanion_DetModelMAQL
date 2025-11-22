@@ -5,7 +5,7 @@ from abc import ABC
 """
 Author: David Goll
 
-This module implements a flexible simulation framework for multi-agent reinforcement learning in repeated normal-form games, as used in the paper:
+This module implements a simulation framework for multi-agent reinforcement learning in repeated normal-form games, as used in the paper:
 "Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning: Transient Cooperation, Metastability, and Oscillations" (D. Goll, J. Heitzig, W. Barfuss, 2024, ArXiv).
 
 Key features:
@@ -14,8 +14,7 @@ Key features:
 - Game and Simulation classes to conduct multi-agent interactions.
 - Utilities for analyzing learning dynamics, fixed points, and stability in the context of the Prisoner's Dilemma and similar games.
 
-Note: The code is research-oriented and tailored for generating figures and results in the referenced paper. 
-While not structured as a general-purpose library, it is organized for clarity, extensibility, and reproducibility of the depicted experiments.
+Note: The code is research-oriented and tailored for generating figures and results in the referenced paper and not intended as a general-purpose library.
 """
 
 ################################### Agent classes ###################################

@@ -702,6 +702,7 @@ class Simulation:
 
 ################################### General Functions ################################### 
 
+# reward function for Prisoner's Dilemma
 def reward_matrix_for_two_player_PD(action_vector, player_id):
     """
     This function calculates the reward of the agent in a two-player Prisoner's Dilemma game.
@@ -728,6 +729,43 @@ def reward_matrix_for_two_player_PD(action_vector, player_id):
     reward = reward_matrix[action_tuple]
     return reward[player_id]
 
+# reward function for Matching Pennies
+def reward_matrix_for_two_player_MP(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    W, L = 1, 0
+    reward_matrix = {
+            (0, 0): (W, L),  
+            (0, 1): (L, W),  
+            (1, 0): (L, W),  
+            (1, 1): (W, L),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
+# reward function for stag hunt
+def reward_matrix_for_two_player_SH(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    reward_matrix = {
+            (0, 0): (4, 4),  
+            (0, 1): (1, 3),  
+            (1, 0): (3, 1),  
+            (1, 1): (3, 3),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
+# reward function for Bach or Stravinsky (battle of sexes)
+def reward_matrix_for_two_player_BS(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    reward_matrix = {
+            (0, 0): (3, 2),  
+            (0, 1): (0, 0),  
+            (1, 0): (0, 0),  
+            (1, 1): (2, 3),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
 def get_individual_matrices(reward_function):
     """
     This function extracts the individual reward matrices from the reward function.
@@ -739,12 +777,12 @@ def get_individual_matrices(reward_function):
                                 [reward_function([1, 0], 1), reward_function([1, 1], 1)]])
     return [reward_matrix_A, reward_matrix_B]
 
-def generate_q_values(prob_to_coop, temperature, base_value):
+def generate_q_values(prob_of_first_action, temperature, base_value):
     """
-    This function generates Q-values for the two actions (cooperate and defect) based on the given probability of cooperation, temperature and a parameter called base_value which governs the overall level.
+    This function generates Q-values for a two-action game, based on a given probability of the first action, temperature and a parameter called base_value which governs the overall level.
     """
     # Calculate the difference between Q-values
-    delta_Q = temperature * np.log(1/prob_to_coop - 1) # difference between Q-values: delta_Q = Q_D - Q_C
+    delta_Q = temperature * np.log(1/prob_of_first_action - 1) # difference between Q-values: delta_Q = Q_D - Q_C
     
     # Calculate Q_D and Q_C centered around the base value
     Q_D = base_value + delta_Q / 2

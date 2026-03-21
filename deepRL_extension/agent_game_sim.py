@@ -454,10 +454,8 @@ class DQNAgent(Agent):
                  selection_method="Boltzmann",
                  exploration_rate=0.1,
                  agent_id=None,
-                 use_replay_buffer=False,
-                 buffer_size=10000,
-                 min_buffer_size=100,
-                 batch_size=32):
+                 buffer_size=1,
+                 batch_size=1):
         """
         Initialize a DQN agent.
 
@@ -478,10 +476,8 @@ class DQNAgent(Agent):
             selection_method: Action selection method (only 'Boltzmann' supported)
             exploration_rate: Not used (for compatibility with base class)
             agent_id: Optional agent identifier
-            use_replay_buffer: Whether to use experience replay buffer
-            buffer_size: Maximum size of replay buffer
-            min_buffer_size: Minimum experiences before training starts
-            batch_size: Number of experiences to sample per training step (only used with replay buffer)
+            buffer_size: Size of replay buffer (1 = no replay, train on current experience only)
+            batch_size: Number of experiences to sample per training step (1 = single experience)
         """
         # For DQN, we only support stateless environments (observation_length=0)
         assert observation_length == 0, "DQNAgent only supports stateless environments (observation_length=0)"
@@ -537,12 +533,9 @@ class DQNAgent(Agent):
         self.q_table_history = [self._get_q_table()]
 
         # Replay buffer setup
-        self.use_replay_buffer = use_replay_buffer
         self.buffer_size = buffer_size
-        self.min_buffer_size = min_buffer_size
         self.batch_size = batch_size
-        if use_replay_buffer:
-            self.replay_buffer = deque(maxlen=buffer_size)
+        self.replay_buffer = deque(maxlen=buffer_size)
 
     def _init_network(self, initial_prob, base_value):
         """
@@ -629,76 +622,42 @@ class DQNAgent(Agent):
         self.action = np.random.choice(self.action_space, p=probs)
         return self.action
 
-    def _train_step(self, reward, action):
-        """
-        Single gradient step on one experience.
-
-        Args:
-            reward: The reward received
-            action: The action taken
-        """
-        action_id = int(np.where(self.action_space == action)[0][0])
-
-        self.optimizer.zero_grad()
-
-        # Forward pass
-        q_values = self._get_q_values_tensor()
-
-        # Compute TD target (detached to prevent gradient flow)
-        with torch.no_grad():
-            max_q = q_values.max().item()
-            target_value = self.prefactor * reward + self.discount_factor * max_q
-            target = torch.tensor(target_value, dtype=torch.float32, device=self.device)
-
-        # MSE loss on the Q-value of the action taken
-        q_action = q_values[action_id]
-        loss = F.mse_loss(q_action, target)
-
-        # Backward pass and update
-        loss.backward()
-        self.optimizer.step()
-
     def update_policy(self, current_info):
         """
         Update network weights using TD learning via gradient descent.
 
-        If replay buffer is enabled, stores experience and trains on a random
-        batch from the buffer (standard DQN). The loss is averaged over the batch,
-        resulting in one gradient step per timestep.
-        Otherwise, trains immediately on current experience.
+        Stores experience in replay buffer, then samples a batch and computes
+        the averaged loss over the batch. With buffer_size=1 and batch_size=1
+        (defaults), this is equivalent to training on the current experience only.
         """
         reward = current_info['reward']
         action = current_info['action']
 
-        if self.use_replay_buffer:
-            # Store experience in buffer
-            self.replay_buffer.append((reward, action))
+        # Store experience in buffer
+        self.replay_buffer.append((reward, action))
 
-            # Train on batch from buffer if enough experiences
-            if len(self.replay_buffer) >= self.min_buffer_size:
-                batch = random.sample(self.replay_buffer, self.batch_size)
+        # Train once buffer has enough experiences for a full batch
+        if len(self.replay_buffer) >= self.batch_size:
+            batch = random.sample(self.replay_buffer, self.batch_size)
 
-                self.optimizer.zero_grad()
-                q_values = self._get_q_values_tensor()
+            self.optimizer.zero_grad()
+            q_values = self._get_q_values_tensor()
 
-                with torch.no_grad():
-                    max_q = q_values.max().item()
+            with torch.no_grad():
+                max_q = q_values.max().item()
 
-                total_loss = torch.tensor(0.0, device=self.device)
-                for r, a in batch:
-                    action_id = int(np.where(self.action_space == a)[0][0])
-                    target = torch.tensor(
-                        self.prefactor * r + self.discount_factor * max_q,
-                        dtype=torch.float32, device=self.device
-                    )
-                    total_loss = total_loss + F.mse_loss(q_values[action_id], target)
+            total_loss = torch.tensor(0.0, device=self.device)
+            for r, a in batch:
+                action_id = int(np.where(self.action_space == a)[0][0])
+                target = torch.tensor(
+                    self.prefactor * r + self.discount_factor * max_q,
+                    dtype=torch.float32, device=self.device
+                )
+                total_loss = total_loss + F.mse_loss(q_values[action_id], target)
 
-                loss = total_loss / len(batch)
-                loss.backward()
-                self.optimizer.step()
-        else:
-            # Original behavior: train on current experience
-            self._train_step(reward, action)
+            loss = total_loss / len(batch)
+            loss.backward()
+            self.optimizer.step()
 
         # Store Q-values in history (for compatibility with tabular analysis)
         self.q_table_history.append(self._get_q_table())
@@ -716,9 +675,8 @@ class DQNAgent(Agent):
         # Reset Q-table history
         self.q_table_history = [self._get_q_table()]
 
-        # Clear replay buffer if used
-        if self.use_replay_buffer:
-            self.replay_buffer.clear()
+        # Clear replay buffer
+        self.replay_buffer.clear()
 
     def get_q_values(self):
         """Get current Q-values as a numpy array [Q_C, Q_D]."""

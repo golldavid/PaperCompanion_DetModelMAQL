@@ -15,18 +15,26 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 """
-Author: David Goll
+Simulation framework for multi-agent reinforcement learning in repeated
+normal-form games.
 
-This module implements a simulation framework for multi-agent reinforcement learning in repeated normal-form games, as used in the paper:
-"Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning: Transient Cooperation, Metastability, and Oscillations" (D. Goll, J. Heitzig, W. Barfuss, 2024, ArXiv).
+Companion code for:
+    "Explaining Metastable Cooperation in Independent Multi-Agent Boltzmann Q-Learning—A Deterministic Approximation"
+    D. Goll, J. Heitzig, W. Barfuss (2026)
+    Preprint from 2024: https://arxiv.org/abs/2501.00160
 
-Key features:
-- Modular agent classes supporting Q-Learning and FrequencyAdjusted Q-learning with extensible design for additional algorithms (SARSA, Expected SARSA, CrossLearning, ...).
-- Abstract Agent base class for repeated games, supporting customizable action spaces, reward functions, and observation histories.
-- Game and Simulation classes to conduct multi-agent interactions.
-- Utilities for analyzing learning dynamics, fixed points, and stability in the context of the Prisoner's Dilemma and similar games.
+Agent classes:
+    - QLearningAgent: Tabular Q-learning with Boltzmann action selection.
+    - DQNAgent: Deep Q-Network (requires PyTorch, install via `uv sync --extra deeprl`).
+    - PPOAgent: Proximal Policy Optimization with actor-critic network (requires PyTorch).
 
-Note: The code is research-oriented and tailored for generating figures and results in the referenced paper and not intended as a general-purpose library.
+Infrastructure:
+    - Game: Manages a single multi-agent interaction step (action selection, rewards, state transitions).
+    - Simulation: Runs the learning loop for a given number of time steps.
+
+Utility functions:
+    - Reward matrices for Prisoner's Dilemma, Matching Pennies, Stag Hunt, and Bach-or-Stravinsky.
+    - Fixed-point and stability analysis for the deterministic Q-learning model (PD-specific).
 """
 
 ################################### Agent classes ###################################

@@ -682,6 +682,253 @@ class DQNAgent(Agent):
         """Get current Q-values as a numpy array [Q_C, Q_D]."""
         return self._get_q_table()[0]
 
+class PPOAgent(Agent):
+    """
+    A Proximal Policy Optimization agent with an actor-critic network.
+
+    Uses a shared hidden layer with separate actor (policy logits) and critic
+    (value estimate) heads. Updates via clipped surrogate objective every
+    `update_interval` steps. Compatible with Game and Simulation classes.
+
+    The agent stores policy logits in q_table_history (shape (1, 2)) so that
+    existing notebook code can extract cooperation probabilities unchanged.
+    """
+
+    def __init__(self,
+                 player_id,
+                 action_space,
+                 num_players,
+                 reward_func,
+                 learning_rate=3e-4,
+                 discount_factor=0.0,
+                 temperature=1.0,
+                 hidden_size=32,
+                 initial_prob=None,
+                 base_value=0.0,
+                 use_prefactor=False,
+                 device='cpu',
+                 observation_length=0,
+                 selection_method="Boltzmann",
+                 exploration_rate=0.1,
+                 agent_id=None,
+                 update_interval=64,
+                 ppo_epochs=4,
+                 clip_epsilon=0.2):
+        assert observation_length == 0, "PPOAgent only supports stateless environments"
+        assert selection_method == "Boltzmann", "PPOAgent only supports Boltzmann action selection"
+
+        # Initialize base class
+        super().__init__(
+            player_id=player_id,
+            action_space=action_space,
+            learning_rate=learning_rate,
+            discount_factor=discount_factor,
+            exploration_rate=exploration_rate,
+            num_players=num_players,
+            observation_length=observation_length,
+            temperature=temperature,
+            reward_func=reward_func,
+            state=None,
+            q_table=None,
+            agent_id=agent_id,
+            selection_method=selection_method
+        )
+
+        self.device = device
+        self.hidden_size = hidden_size
+        self.base_value = base_value
+        self.update_interval = update_interval
+        self.ppo_epochs = ppo_epochs
+        self.clip_epsilon = clip_epsilon
+
+        self.prefactor = (1 - self.discount_factor) if use_prefactor else 1
+
+        # Build actor-critic network: shared hidden layer
+        self.shared = nn.Sequential(
+            nn.Linear(1, hidden_size),
+            nn.ReLU(),
+        ).to(device)
+        self.actor_head = nn.Linear(hidden_size, self.num_actions).to(device)
+        self.critic_head = nn.Linear(hidden_size, 1).to(device)
+
+        # Initialize and set initial policy logits
+        self._init_network(initial_prob, base_value)
+
+        self.optimizer = optim.Adam(
+            list(self.shared.parameters()) +
+            list(self.actor_head.parameters()) +
+            list(self.critic_head.parameters()),
+            lr=learning_rate
+        )
+
+        self._dummy_state = torch.tensor([[1.0]], device=device)
+
+        # Store initial weights for reset
+        self._initial_state_dicts = {
+            'shared': {k: v.clone() for k, v in self.shared.state_dict().items()},
+            'actor': {k: v.clone() for k, v in self.actor_head.state_dict().items()},
+            'critic': {k: v.clone() for k, v in self.critic_head.state_dict().items()},
+        }
+
+        # Trajectory buffer
+        self._trajectory = []  # list of (action_id, reward, log_prob, value)
+        self._step_count = 0
+
+        # Store policy logits as "q_table" for compatibility
+        self.q_table_history = [self._get_q_table()]
+
+    def _init_network(self, initial_prob, base_value):
+        """Initialize network weights; set actor bias to produce desired initial policy."""
+        with torch.no_grad():
+            for module in list(self.shared.modules()) + [self.actor_head, self.critic_head]:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                    nn.init.zeros_(module.bias)
+
+            if initial_prob is not None:
+                p = np.clip(initial_prob, 0.001, 0.999)
+                # logit_C - logit_D = log(p / (1-p)) (under temperature=1 softmax)
+                # Centre around 0: logit_C = +delta/2, logit_D = -delta/2
+                delta = self.temperature * np.log(p / (1 - p))
+                self.actor_head.bias.data = torch.tensor(
+                    [delta / 2, -delta / 2], dtype=torch.float32, device=self.device
+                )
+
+            # Initialize critic bias to base_value
+            self.critic_head.bias.data.fill_(base_value)
+
+    def _forward(self):
+        """Forward pass through the network. Returns (logits, value)."""
+        h = self.shared(self._dummy_state)
+        logits = self.actor_head(h).squeeze()       # shape (num_actions,)
+        value = self.critic_head(h).squeeze()        # scalar
+        return logits, value
+
+    def _get_q_table(self):
+        """Return policy logits as shape (1, num_actions) for compatibility."""
+        with torch.no_grad():
+            logits, _ = self._forward()
+        return logits.cpu().numpy().reshape(1, -1)
+
+    def get_action_probabilities(self, q_table=None):
+        """
+        Compute action probabilities via softmax over logits / temperature.
+
+        If q_table (logits) is provided, compute from that; otherwise use
+        the current network.
+        """
+        if q_table is not None:
+            logits = q_table.flatten()
+            exp_l = np.exp(logits / self.temperature)
+            probs = exp_l / np.sum(exp_l)
+            return probs.reshape(1, -1)
+        else:
+            with torch.no_grad():
+                logits, _ = self._forward()
+                probs = F.softmax(logits / self.temperature, dim=0)
+            return probs.cpu().numpy().reshape(1, -1)
+
+    def choose_action(self, state):
+        """Sample an action from the current policy."""
+        if state < 0:
+            self.action = 0
+            return self.action
+
+        probs = self.get_action_probabilities()[0]
+        self.action = np.random.choice(self.action_space, p=probs)
+        return self.action
+
+    def update_policy(self, current_info):
+        """
+        Store transition in trajectory buffer. Every `update_interval` steps,
+        compute GAE advantages and run PPO clipped update for `ppo_epochs`.
+        """
+        reward = current_info['reward']
+        action = current_info['action']
+        action_id = int(np.where(self.action_space == action)[0][0])
+
+        # Get current log_prob and value for this action
+        logits, value = self._forward()
+        dist = torch.distributions.Categorical(logits=logits / self.temperature)
+        log_prob = dist.log_prob(torch.tensor(action_id, device=self.device))
+
+        self._trajectory.append((
+            action_id,
+            self.prefactor * reward,
+            log_prob.detach(),
+            value.detach(),
+        ))
+        self._step_count += 1
+
+        # PPO update every update_interval steps
+        if self._step_count % self.update_interval == 0 and len(self._trajectory) > 0:
+            self._ppo_update()
+
+        # Store logits in history
+        self.q_table_history.append(self._get_q_table())
+
+    def _ppo_update(self):
+        """Run PPO clipped surrogate update on collected trajectory."""
+        action_ids = torch.tensor([t[0] for t in self._trajectory], device=self.device)
+        rewards = torch.tensor([t[1] for t in self._trajectory], dtype=torch.float32, device=self.device)
+        old_log_probs = torch.stack([t[2] for t in self._trajectory])
+        old_values = torch.stack([t[3] for t in self._trajectory])
+
+        # Compute advantages using GAE(lambda=1) = discounted returns - values
+        # For the stateless case, the "next value" after each step is the current
+        # value estimate (since the state doesn't change).
+        with torch.no_grad():
+            _, bootstrap_value = self._forward()
+        returns = torch.zeros_like(rewards)
+        R = bootstrap_value
+        for i in reversed(range(len(rewards))):
+            R = rewards[i] + self.discount_factor * R
+            returns[i] = R
+
+        advantages = returns - old_values
+        # Normalize advantages
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # PPO epochs
+        for _ in range(self.ppo_epochs):
+            logits, values = self._forward()
+            dist = torch.distributions.Categorical(logits=logits / self.temperature)
+            new_log_probs = dist.log_prob(action_ids)
+
+            # Clipped surrogate objective
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value loss
+            value_loss = F.mse_loss(values.expand_as(returns), returns)
+
+            loss = policy_loss + 0.5 * value_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        # Clear trajectory
+        self._trajectory.clear()
+
+    def reset(self):
+        """Reset agent to initial state."""
+        self.state = -self.observation_length
+        self.state_history = []
+        self.observation = ''
+
+        self.shared.load_state_dict(self._initial_state_dicts['shared'])
+        self.actor_head.load_state_dict(self._initial_state_dicts['actor'])
+        self.critic_head.load_state_dict(self._initial_state_dicts['critic'])
+
+        self._trajectory.clear()
+        self._step_count = 0
+
+        self.q_table_history = [self._get_q_table()]
+
 
 ################################### Game class ###################################
 
@@ -743,6 +990,8 @@ class Game:
             if isinstance(agent, QLearningAgent):
                 current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
             elif isinstance(agent, DQNAgent):
+                current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
+            elif isinstance(agent, PPOAgent):
                 current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
 
         return current_info_vector

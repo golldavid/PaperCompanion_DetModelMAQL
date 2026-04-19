@@ -1,0 +1,17 @@
+[project]
+name = "paper-companion-det-model-maql"
+version = "1.0.0"
+description = "Companion code for: Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "matplotlib>=3.8",
+    "scipy>=1.15",
+    "jupyter",
+    "ipykernel",
+]
+
+[project.optional-dependencies]
+deeprl = [
+    "torch>=2.0",
+]

@@ -55,11 +55,3 @@ Optional deep-RL dependencies:
 
 - Simulation data is saved and loaded from the `data/` directory.
 - If `load_data` is set to `False` in a notebook, new simulations will be run and data will be generated.
-
-### Example
-
-To reproduce the deterministic learning trajectories in policy space (Figure 3):
-
-- Open `PaperCompaniowill be created locally (not tracked in git)
-- Run all cells
-- View generated outputs locally

@@ -37,7 +37,7 @@ It focuses on learning dynamics in repeated games such as the Prisoner's Dilemma
 
 If you use `uv`, install from the lockfile:
    ```sh
-   uv install
+   uv sync
    ```
 
 Optional deep-RL dependencies:

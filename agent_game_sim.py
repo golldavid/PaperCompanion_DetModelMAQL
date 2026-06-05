@@ -1,20 +1,40 @@
 import numpy as np
 from scipy.optimize import fsolve
 from abc import ABC
+from collections import deque
+import random
+
+# PyTorch is an optional dependency (only needed for DQNAgent and PPOAgent)
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 """
-Author: David Goll
+Simulation framework for multi-agent reinforcement learning in repeated
+normal-form games.
 
-This module implements a simulation framework for multi-agent reinforcement learning in repeated normal-form games, as used in the paper:
-"Deterministic Model of Incremental Multi-Agent Boltzmann Q-Learning: Transient Cooperation, Metastability, and Oscillations" (D. Goll, J. Heitzig, W. Barfuss, 2024, ArXiv).
+Companion code for:
+    "Explaining Metastable Cooperation in Independent Multi-Agent Boltzmann Q-Learning—A Deterministic Approximation"
+    D. Goll, J. Heitzig, W. Barfuss (2026)
+    Preprint from 2024: https://arxiv.org/abs/2501.00160
 
-Key features:
-- Modular agent classes supporting Q-Learning and FrequencyAdjusted Q-learning with extensible design for additional algorithms (SARSA, Expected SARSA, CrossLearning, ...).
-- Abstract Agent base class for repeated games, supporting customizable action spaces, reward functions, and observation histories.
-- Game and Simulation classes to conduct multi-agent interactions.
-- Utilities for analyzing learning dynamics, fixed points, and stability in the context of the Prisoner's Dilemma and similar games.
+Agent classes:
+    - QLearningAgent: Tabular Q-learning with Boltzmann action selection.
+    - DQNAgent: Deep Q-Network (requires PyTorch, install via `uv sync --extra deeprl`).
+    - PPOAgent: Proximal Policy Optimization with actor-critic network (requires PyTorch).
 
-Note: The code is research-oriented and tailored for generating figures and results in the referenced paper and not intended as a general-purpose library.
+Infrastructure:
+    - Game: Manages a single multi-agent interaction step (action selection, rewards, state transitions).
+    - Simulation: Runs the learning loop for a given number of time steps.
+
+Utility functions:
+    - Reward matrices for Prisoner's Dilemma, Matching Pennies, Stag Hunt, and Bach-or-Stravinsky.
+    - Fixed-point and stability analysis for the deterministic Q-learning model (PD-specific).
 """
 
 ################################### Agent classes ###################################
@@ -421,157 +441,512 @@ class QLearningAgent(Agent):
         self.q_table[state, action_id] = (1 - self.learning_rate) * self.q_table[state, action_id] + self.learning_rate * ( self.prefactor * reward + self.discount_factor * np.max(self.q_table[next_state, :]) ) 
         self.q_table_history.append(self.q_table.copy()) 
 
-class SarsaAgent(Agent):
+class DQNAgent(Agent):
     """
-    This class implements a SARSA agent.
+    A Deep Q-Network agent that uses a small neural network instead of a Q-table.
 
-    Args:
-        Agent (_type_): _description_
+    Inherits from Agent to be compatible with Game and Simulation classes.
+    The network outputs Q-values for each action, and action selection uses
+    Boltzmann (softmax) exploration.
     """
-    def __init__(self, 
+
+    def __init__(self,
                  player_id,
-                 action_space, 
-                 learning_rate = 0.1, 
-                 discount_factor = 0.9, 
-                 exploration_rate = 0.2,
-                 num_players = None,
-                 observation_length = 0,
-                 temperature = 1,
-                 reward_func = None,
-                 state = None, 
-                 q_table = None,
-                 agent_id = None,
-                 selection_method="epsilon_greedy",
-                 use_prefactor = False):
-        super().__init__(player_id,
-                         action_space, 
-                         learning_rate, 
-                         discount_factor, 
-                         exploration_rate,
-                         num_players,
-                         observation_length,
-                         temperature,
-                         reward_func,
-                         state, 
-                         q_table,
-                         agent_id,
-                         selection_method)
-        # Add any Sarsa-specific initialization here
-        self.name = "SARSA"
+                 action_space,
+                 num_players,
+                 reward_func,
+                 learning_rate=0.01,
+                 discount_factor=0.0,
+                 temperature=1.0,
+                 hidden_size=32,
+                 initial_prob=None,
+                 base_value=0.0,
+                 use_prefactor=True,
+                 device='cpu',
+                 observation_length=0,
+                 selection_method="Boltzmann",
+                 exploration_rate=0.1,
+                 agent_id=None,
+                 buffer_size=1,
+                 batch_size=1):
+        """
+        Initialize a DQN agent.
+
+        Args:
+            player_id: The player ID (0 or 1 for two-player games)
+            action_space: Array of possible actions (e.g., np.array([0, 1]))
+            num_players: Number of players in the game
+            reward_func: Reward function that takes (action_vector, player_id)
+            learning_rate: Learning rate for SGD optimizer
+            discount_factor: Discount factor gamma for TD learning
+            temperature: Temperature for Boltzmann action selection
+            hidden_size: Number of hidden units in the network
+            initial_prob: Initial cooperation probability (if None, starts near 0.5)
+            base_value: Base Q-value level (for matching tabular initialization)
+            use_prefactor: Whether to use (1-gamma) prefactor on rewards
+            device: PyTorch device ('cpu' or 'cuda')
+            observation_length: Must be 0 (stateless environment)
+            selection_method: Action selection method (only 'Boltzmann' supported)
+            exploration_rate: Not used (for compatibility with base class)
+            agent_id: Optional agent identifier
+            buffer_size: Size of replay buffer (1 = no replay, train on current experience only)
+            batch_size: Number of experiences to sample per training step (1 = single experience)
+        """
+        if not _TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for DQNAgent. Install with: uv sync --extra deeprl")
+        # For DQN, we only support stateless environments (observation_length=0)
+        assert observation_length == 0, "DQNAgent only supports stateless environments (observation_length=0)"
+        assert selection_method == "Boltzmann", "DQNAgent only supports Boltzmann action selection"
+
+        # Initialize base class (creates self.q_table which we won't use)
+        super().__init__(
+            player_id=player_id,
+            action_space=action_space,
+            learning_rate=learning_rate,
+            discount_factor=discount_factor,
+            exploration_rate=exploration_rate,
+            num_players=num_players,
+            observation_length=observation_length,
+            temperature=temperature,
+            reward_func=reward_func,
+            state=None,
+            q_table=None,
+            agent_id=agent_id,
+            selection_method=selection_method
+        )
+
+        self.device = device
+        self.hidden_size = hidden_size
+        self.base_value = base_value
+
+        # Prefactor for reward normalization (matches tabular convention)
         if use_prefactor:
             self.prefactor = (1 - self.discount_factor)
         else:
             self.prefactor = 1
-        self.prev_state = None
-        self.prev_action = None
-        self.prev_reward = None
-    
-    def reset(self):
-        super().reset()
-        self.prev_state = None
-        self.prev_action = None
-        self.prev_reward = None
 
-    def update_policy(self, current_info):
+        # Build neural network: 1 -> hidden_size -> 2
+        self.network = nn.Sequential(
+            nn.Linear(1, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, self.num_actions)
+        ).to(device)
+
+        # Initialize weights and set initial Q-values
+        self._init_network(initial_prob, base_value)
+
+        # Use SGD optimizer (closest to tabular incremental updates)
+        self.optimizer = optim.SGD(self.network.parameters(), lr=learning_rate)
+
+        # Dummy input for stateless environment
+        self._dummy_state = torch.tensor([[1.0]], device=device)
+
+        # Store initial network state for reset
+        self._initial_state_dict = {k: v.clone() for k, v in self.network.state_dict().items()}
+
+        # Override q_table_history to store Q-values from network
+        self.q_table_history = [self._get_q_table()]
+
+        # Replay buffer setup
+        self.buffer_size = buffer_size
+        self.batch_size = batch_size
+        self.replay_buffer = deque(maxlen=buffer_size)
+
+    def _init_network(self, initial_prob, base_value):
         """
-        This function updates the Q-table of the SarsaAgent according to the SARSA algorithm.
+        Initialize network weights to produce desired initial Q-values.
 
-        Args:
-            current_info (dict): Dictionary containing 'prev_state', 'prev_action', 'prev_reward', 'state', 'action', 'reward' and 'next_state'.
+        Matches the tabular initialization from generate_q_values():
+            delta_Q = T * log(1/p_coop - 1)
+            Q_D = base_value + delta_Q / 2
+            Q_C = base_value - delta_Q / 2
         """
-        prev_state = current_info['prev_state']
-        prev_action = current_info['prev_action']
-        prev_reward = current_info['prev_reward']
-        state = current_info['state']
-        action = current_info['action']
-        prev_action_id = np.where(self.action_space == prev_action)
-        action_id = np.where(self.action_space == action)
+        with torch.no_grad():
+            # Initialize hidden layer with small weights
+            for module in self.network.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                    nn.init.zeros_(module.bias)
 
-        # don't update policy if prev_state is None or negative
-        if prev_state == None or prev_state < 0:
-            return
+            if initial_prob is not None:
+                # Clamp probability to avoid log(0) or log(inf)
+                p = np.clip(initial_prob, 0.001, 0.999)
 
-        # update Q-value
-        self.q_table[prev_state, prev_action_id] = (1 - self.learning_rate) * self.q_table[prev_state, prev_action_id] + self.learning_rate * ( self.prefactor * prev_reward + self.discount_factor * self.q_table[state, action_id] ) 
-        self.q_table_history.append(self.q_table.copy())   
-        
-    def update_attributes(self, current_info):
+                # Calculate Q-values matching tabular initialization
+                delta_Q = self.temperature * np.log(1/p - 1)
+                Q_C = base_value - delta_Q / 2
+                Q_D = base_value + delta_Q / 2
+
+                # Set output layer bias to desired Q-values
+                # With small weights, output ≈ bias
+                output_layer = self.network[-1]
+                output_layer.bias.data = torch.tensor([Q_C, Q_D], dtype=torch.float32, device=self.device)
+
+    def _get_q_values_tensor(self):
+        """Get Q-values as a PyTorch tensor."""
+        return self.network(self._dummy_state).squeeze()
+
+    def _get_q_table(self):
         """
-        This function updates the attributes of the SarsaAgent.
-
-        Args:
-            current_info (dict): Dictionary containing 'state', 'action', 'reward' and 'next_state'.
+        Get Q-values in the same format as tabular Q-table.
+        Returns shape (1, num_actions) for compatibility.
         """
-        state = current_info['state']
-        action = current_info['action']
-        reward = current_info['reward']
-        next_state = current_info['next_state']
+        with torch.no_grad():
+            q_values = self._get_q_values_tensor().cpu().numpy()
+        return q_values.reshape(1, -1)
 
-        self.state_history.append(state) # save state in attribute of agent
+    def get_action_probabilities(self, q_table=None):
+        """
+        Calculate Boltzmann action probabilities.
 
-        self.prev_state = state
-        self.prev_action = action
-        self.prev_reward = reward
-        self.state = next_state
-
-class FreqAdjustedQLearningAgent(QLearningAgent):
-    def __init__(self, 
-                 player_id,
-                 action_space, 
-                 learning_rate = 0.1, 
-                 discount_factor = 0.9, 
-                 exploration_rate = 0.2,
-                 num_players = None,
-                 observation_length = 0,
-                 temperature = 1,
-                 reward_func = None,
-                 state = None, 
-                 q_table = None,
-                 agent_id = None,
-                 selection_method="epsilon_greedy",
-                 use_prefactor = False,
-                 learning_rate_adjustment = None):
-        super().__init__(player_id,
-                         action_space, 
-                         learning_rate, 
-                         discount_factor, 
-                         exploration_rate,
-                         num_players,
-                         observation_length,
-                         temperature,
-                         reward_func,
-                         state, 
-                         q_table,
-                         agent_id,
-                         selection_method, 
-                         use_prefactor)
-        self.name = "FreqAdjustedQL"
-        if learning_rate_adjustment is None:
-            self.learning_rate_adjustment = learning_rate
+        If q_table is provided (e.g., from history), compute from that.
+        Otherwise, use current network Q-values.
+        Returns shape (1, num_actions) for compatibility with base class.
+        """
+        if q_table is not None:
+            # Use provided q_table (e.g., from q_table_history)
+            q_values = q_table.flatten()
+            exp_q = np.exp(q_values / self.temperature)
+            probs = exp_q / np.sum(exp_q)
+            return probs.reshape(1, -1)
         else:
-            self.learning_rate_adjustment = learning_rate_adjustment 
+            # Use current network
+            with torch.no_grad():
+                q_values = self._get_q_values_tensor()
+                probs = F.softmax(q_values / self.temperature, dim=0)
+            return probs.cpu().numpy().reshape(1, -1)
+
+    def get_cooperation_probability(self):
+        """Get the probability of cooperation (action 0)."""
+        return self.get_action_probabilities()[0, 0]
+
+    def choose_action(self, state):
+        """
+        Choose an action using Boltzmann exploration.
+
+        Overrides base class to handle the stateless case properly.
+        For stateless environment, state should always be 0.
+        """
+        # For burn-in period (negative states), always cooperate
+        if state < 0:
+            self.action = 0
+            return self.action
+
+        # Sample from Boltzmann distribution
+        probs = self.get_action_probabilities()[0]
+        self.action = np.random.choice(self.action_space, p=probs)
+        return self.action
 
     def update_policy(self, current_info):
         """
-        This function updates the Q-table of the QLearningAgent according to the Q-Learning algorithm.
-        The prefactor (1 - self.discount_factor) is missing in the formula in the book (Sutton & Barto, 2018, p. 131. It is taken from 2021 paper by Barfuss:
-        "factor (1 - self.discount_factor) normalizes the state- action values to be on the same numerical scale as the rewards." - Barfuss "Dynamical systems as a level of cognitive analysis of multi-agent learning" 2021, p. 4
+        Update network weights using TD learning via gradient descent.
 
-        Args:
-            current_info (dict): Dictionary containing the current information which is presented to the agents.
+        Stores experience in replay buffer, then samples a batch and computes
+        the averaged loss over the batch. With buffer_size=1 and batch_size=1
+        (defaults), this is equivalent to training on the current experience only.
         """
-        state = current_info['state']
-        action = current_info['action']
         reward = current_info['reward']
-        next_state = current_info['next_state']
-        action_id = np.where(self.action_space == action)
+        action = current_info['action']
 
-        # get probability to choose the action
-        action_probability = self.get_action_probabilities(self.q_table)[state][action_id]
+        # Store experience in buffer
+        self.replay_buffer.append((reward, action))
 
-        # update Q-value
-        self.q_table[state, action_id] = self.q_table[state, action_id] + min(self.learning_rate_adjustment/action_probability, 1) * self.learning_rate * ( self.prefactor * reward + self.discount_factor * np.max(self.q_table[next_state, :]) - self.q_table[state, action_id]) 
-        self.q_table_history.append(self.q_table.copy()) 
+        # Train once buffer has enough experiences for a full batch
+        if len(self.replay_buffer) >= self.batch_size:
+            batch = random.sample(self.replay_buffer, self.batch_size)
+
+            self.optimizer.zero_grad()
+            q_values = self._get_q_values_tensor()
+
+            with torch.no_grad():
+                max_q = q_values.max().item()
+
+            total_loss = torch.tensor(0.0, device=self.device)
+            for r, a in batch:
+                action_id = int(np.where(self.action_space == a)[0][0])
+                target = torch.tensor(
+                    self.prefactor * r + self.discount_factor * max_q,
+                    dtype=torch.float32, device=self.device
+                )
+                total_loss = total_loss + F.mse_loss(q_values[action_id], target)
+
+            loss = total_loss / len(batch)
+            loss.backward()
+            self.optimizer.step()
+
+        # Store Q-values in history (for compatibility with tabular analysis)
+        self.q_table_history.append(self._get_q_table())
+
+    def reset(self):
+        """Reset the agent to initial state."""
+        # Reset base class attributes
+        self.state = -self.observation_length
+        self.state_history = []
+        self.observation = ''
+
+        # Reset network to initial weights
+        self.network.load_state_dict(self._initial_state_dict)
+
+        # Reset Q-table history
+        self.q_table_history = [self._get_q_table()]
+
+        # Clear replay buffer
+        self.replay_buffer.clear()
+
+    def get_q_values(self):
+        """Get current Q-values as a numpy array [Q_C, Q_D]."""
+        return self._get_q_table()[0]
+
+class PPOAgent(Agent):
+    """
+    A Proximal Policy Optimization agent with an actor-critic network.
+
+    Uses a shared hidden layer with separate actor (policy logits) and critic
+    (value estimate) heads. Updates via clipped surrogate objective every
+    `update_interval` steps. Compatible with Game and Simulation classes.
+
+    The agent stores policy logits in q_table_history (shape (1, 2)) so that
+    existing notebook code can extract cooperation probabilities unchanged.
+    """
+
+    def __init__(self,
+                 player_id,
+                 action_space,
+                 num_players,
+                 reward_func,
+                 learning_rate=3e-4,
+                 discount_factor=0.0,
+                 temperature=1.0,
+                 hidden_size=32,
+                 initial_prob=None,
+                 base_value=0.0,
+                 use_prefactor=False,
+                 device='cpu',
+                 observation_length=0,
+                 selection_method="Boltzmann",
+                 exploration_rate=0.1,
+                 agent_id=None,
+                 update_interval=64,
+                 ppo_epochs=4,
+                 clip_epsilon=0.2):
+        assert observation_length == 0, "PPOAgent only supports stateless environments"
+        assert selection_method == "Boltzmann", "PPOAgent only supports Boltzmann action selection"
+
+        if not _TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for PPOAgent. Install with: uv sync --extra deeprl")
+
+        # Initialize base class
+        super().__init__(
+            player_id=player_id,
+            action_space=action_space,
+            learning_rate=learning_rate,
+            discount_factor=discount_factor,
+            exploration_rate=exploration_rate,
+            num_players=num_players,
+            observation_length=observation_length,
+            temperature=temperature,
+            reward_func=reward_func,
+            state=None,
+            q_table=None,
+            agent_id=agent_id,
+            selection_method=selection_method
+        )
+
+        self.device = device
+        self.hidden_size = hidden_size
+        self.base_value = base_value
+        self.update_interval = update_interval
+        self.ppo_epochs = ppo_epochs
+        self.clip_epsilon = clip_epsilon
+
+        self.prefactor = (1 - self.discount_factor) if use_prefactor else 1
+
+        # Build actor-critic network: shared hidden layer
+        self.shared = nn.Sequential(
+            nn.Linear(1, hidden_size),
+            nn.ReLU(),
+        ).to(device)
+        self.actor_head = nn.Linear(hidden_size, self.num_actions).to(device)
+        self.critic_head = nn.Linear(hidden_size, 1).to(device)
+
+        # Initialize and set initial policy logits
+        self._init_network(initial_prob, base_value)
+
+        self.optimizer = optim.Adam(
+            list(self.shared.parameters()) +
+            list(self.actor_head.parameters()) +
+            list(self.critic_head.parameters()),
+            lr=learning_rate
+        )
+
+        self._dummy_state = torch.tensor([[1.0]], device=device)
+
+        # Store initial weights for reset
+        self._initial_state_dicts = {
+            'shared': {k: v.clone() for k, v in self.shared.state_dict().items()},
+            'actor': {k: v.clone() for k, v in self.actor_head.state_dict().items()},
+            'critic': {k: v.clone() for k, v in self.critic_head.state_dict().items()},
+        }
+
+        # Trajectory buffer
+        self._trajectory = []  # list of (action_id, reward, log_prob, value)
+        self._step_count = 0
+
+        # Store policy logits as "q_table" for compatibility
+        self.q_table_history = [self._get_q_table()]
+
+    def _init_network(self, initial_prob, base_value):
+        """Initialize network weights; set actor bias to produce desired initial policy."""
+        with torch.no_grad():
+            for module in list(self.shared.modules()) + [self.actor_head, self.critic_head]:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                    nn.init.zeros_(module.bias)
+
+            if initial_prob is not None:
+                p = np.clip(initial_prob, 0.001, 0.999)
+                # logit_C - logit_D = log(p / (1-p)) (under temperature=1 softmax)
+                # Centre around 0: logit_C = +delta/2, logit_D = -delta/2
+                delta = self.temperature * np.log(p / (1 - p))
+                self.actor_head.bias.data = torch.tensor(
+                    [delta / 2, -delta / 2], dtype=torch.float32, device=self.device
+                )
+
+            # Initialize critic bias to base_value
+            self.critic_head.bias.data.fill_(base_value)
+
+    def _forward(self):
+        """Forward pass through the network. Returns (logits, value)."""
+        h = self.shared(self._dummy_state)
+        logits = self.actor_head(h).squeeze()       # shape (num_actions,)
+        value = self.critic_head(h).squeeze()        # scalar
+        return logits, value
+
+    def _get_q_table(self):
+        """Return policy logits as shape (1, num_actions) for compatibility."""
+        with torch.no_grad():
+            logits, _ = self._forward()
+        return logits.cpu().numpy().reshape(1, -1)
+
+    def get_action_probabilities(self, q_table=None):
+        """
+        Compute action probabilities via softmax over logits / temperature.
+
+        If q_table (logits) is provided, compute from that; otherwise use
+        the current network.
+        """
+        if q_table is not None:
+            logits = q_table.flatten()
+            exp_l = np.exp(logits / self.temperature)
+            probs = exp_l / np.sum(exp_l)
+            return probs.reshape(1, -1)
+        else:
+            with torch.no_grad():
+                logits, _ = self._forward()
+                probs = F.softmax(logits / self.temperature, dim=0)
+            return probs.cpu().numpy().reshape(1, -1)
+
+    def choose_action(self, state):
+        """Sample an action from the current policy."""
+        if state < 0:
+            self.action = 0
+            return self.action
+
+        probs = self.get_action_probabilities()[0]
+        self.action = np.random.choice(self.action_space, p=probs)
+        return self.action
+
+    def update_policy(self, current_info):
+        """
+        Store transition in trajectory buffer. Every `update_interval` steps,
+        compute GAE advantages and run PPO clipped update for `ppo_epochs`.
+        """
+        reward = current_info['reward']
+        action = current_info['action']
+        action_id = int(np.where(self.action_space == action)[0][0])
+
+        # Get current log_prob and value for this action
+        logits, value = self._forward()
+        dist = torch.distributions.Categorical(logits=logits / self.temperature)
+        log_prob = dist.log_prob(torch.tensor(action_id, device=self.device))
+
+        self._trajectory.append((
+            action_id,
+            self.prefactor * reward,
+            log_prob.detach(),
+            value.detach(),
+        ))
+        self._step_count += 1
+
+        # PPO update every update_interval steps
+        if self._step_count % self.update_interval == 0 and len(self._trajectory) > 0:
+            self._ppo_update()
+
+        # Store logits in history
+        self.q_table_history.append(self._get_q_table())
+
+    def _ppo_update(self):
+        """Run PPO clipped surrogate update on collected trajectory."""
+        action_ids = torch.tensor([t[0] for t in self._trajectory], device=self.device)
+        rewards = torch.tensor([t[1] for t in self._trajectory], dtype=torch.float32, device=self.device)
+        old_log_probs = torch.stack([t[2] for t in self._trajectory])
+        old_values = torch.stack([t[3] for t in self._trajectory])
+
+        # Compute advantages using GAE(lambda=1) = discounted returns - values
+        # For the stateless case, the "next value" after each step is the current
+        # value estimate (since the state doesn't change).
+        with torch.no_grad():
+            _, bootstrap_value = self._forward()
+        returns = torch.zeros_like(rewards)
+        R = bootstrap_value
+        for i in reversed(range(len(rewards))):
+            R = rewards[i] + self.discount_factor * R
+            returns[i] = R
+
+        advantages = returns - old_values
+        # Normalize advantages
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # PPO epochs
+        for _ in range(self.ppo_epochs):
+            logits, values = self._forward()
+            dist = torch.distributions.Categorical(logits=logits / self.temperature)
+            new_log_probs = dist.log_prob(action_ids)
+
+            # Clipped surrogate objective
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value loss
+            value_loss = F.mse_loss(values.expand_as(returns), returns)
+
+            loss = policy_loss + 0.5 * value_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        # Clear trajectory
+        self._trajectory.clear()
+
+    def reset(self):
+        """Reset agent to initial state."""
+        self.state = -self.observation_length
+        self.state_history = []
+        self.observation = ''
+
+        self.shared.load_state_dict(self._initial_state_dicts['shared'])
+        self.actor_head.load_state_dict(self._initial_state_dicts['actor'])
+        self.critic_head.load_state_dict(self._initial_state_dicts['critic'])
+
+        self._trajectory.clear()
+        self._step_count = 0
+
+        self.q_table_history = [self._get_q_table()]
+
 
 ################################### Game class ###################################
 
@@ -632,7 +1007,11 @@ class Game:
         for agent in self.agents:
             if isinstance(agent, QLearningAgent):
                 current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
-        
+            elif isinstance(agent, DQNAgent):
+                current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
+            elif isinstance(agent, PPOAgent):
+                current_info_vector.append({'state': agent.state, 'action': agent.action, 'reward': agent.reward, 'next_state': agent.next_state})
+
         return current_info_vector
  
 ################################### Simulation class ###################################
@@ -702,6 +1081,7 @@ class Simulation:
 
 ################################### General Functions ################################### 
 
+# reward function for Prisoner's Dilemma
 def reward_matrix_for_two_player_PD(action_vector, player_id):
     """
     This function calculates the reward of the agent in a two-player Prisoner's Dilemma game.
@@ -728,6 +1108,43 @@ def reward_matrix_for_two_player_PD(action_vector, player_id):
     reward = reward_matrix[action_tuple]
     return reward[player_id]
 
+# reward function for Matching Pennies
+def reward_matrix_for_two_player_MP(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    W, L = 1, 0
+    reward_matrix = {
+            (0, 0): (W, L),  
+            (0, 1): (L, W),  
+            (1, 0): (L, W),  
+            (1, 1): (W, L),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
+# reward function for stag hunt
+def reward_matrix_for_two_player_SH(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    reward_matrix = {
+            (0, 0): (4, 4),  
+            (0, 1): (1, 3),  
+            (1, 0): (3, 1),  
+            (1, 1): (3, 3),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
+# reward function for Bach or Stravinsky (battle of sexes)
+def reward_matrix_for_two_player_BS(action_vector, player_id):
+    action_tuple = tuple(action_vector)
+    reward_matrix = {
+            (0, 0): (3, 2),  
+            (0, 1): (0, 0),  
+            (1, 0): (0, 0),  
+            (1, 1): (2, 3),  
+        }
+    reward = reward_matrix[action_tuple]
+    return reward[player_id]
+
 def get_individual_matrices(reward_function):
     """
     This function extracts the individual reward matrices from the reward function.
@@ -739,12 +1156,12 @@ def get_individual_matrices(reward_function):
                                 [reward_function([1, 0], 1), reward_function([1, 1], 1)]])
     return [reward_matrix_A, reward_matrix_B]
 
-def generate_q_values(prob_to_coop, temperature, base_value):
+def generate_q_values(prob_of_first_action, temperature, base_value):
     """
-    This function generates Q-values for the two actions (cooperate and defect) based on the given probability of cooperation, temperature and a parameter called base_value which governs the overall level.
+    This function generates Q-values for a two-action game, based on a given probability of the first action, temperature and a parameter called base_value which governs the overall level.
     """
     # Calculate the difference between Q-values
-    delta_Q = temperature * np.log(1/prob_to_coop - 1) # difference between Q-values: delta_Q = Q_D - Q_C
+    delta_Q = temperature * np.log(1/prob_of_first_action - 1) # difference between Q-values: delta_Q = Q_D - Q_C
     
     # Calculate Q_D and Q_C centered around the base value
     Q_D = base_value + delta_Q / 2

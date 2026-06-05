@@ -11,7 +11,7 @@ venv/
 env/
 
 # Data and Figures
-data/
+data/IteratedPrisonersDilemma/
 PaperFigures/
 *.png
 *.jpg
